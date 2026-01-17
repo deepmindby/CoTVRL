@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 from typing import List, Optional, Dict, Any
 from tqdm import tqdm
 import math
+import gc
 
 from .base import BaseCoTVectorMethod
 from ..models import CoTModelWrapper
@@ -19,7 +20,7 @@ from ..data_utils import PROMPT_TEMPLATES
 class CoTDataset(Dataset):
     """Dataset for CoT vector training."""
     
-    def __init__(self, samples: List, tokenizer, dataset_type: str, max_length: int = 2048):
+    def __init__(self, samples: List, tokenizer, dataset_type: str, max_length: int = 1024):
         self.samples = samples
         self.tokenizer = tokenizer
         self.dataset_type = dataset_type
@@ -52,20 +53,18 @@ class CoTDataset(Dataset):
                 question=sample.question
             ) + f"The answer is {sample.answer}"
         
-        # Tokenize
+        # Tokenize without padding (will pad in collate_fn)
         teacher_enc = self.tokenizer(
             teacher_prompt, 
             return_tensors="pt", 
             truncation=True, 
             max_length=self.max_length,
-            padding="max_length"
         )
         student_enc = self.tokenizer(
             student_prompt,
             return_tensors="pt",
             truncation=True,
             max_length=self.max_length,
-            padding="max_length"
         )
         
         # Get answer token positions
@@ -73,19 +72,69 @@ class CoTDataset(Dataset):
         answer_ids = self.tokenizer(answer_text, add_special_tokens=False)["input_ids"]
         answer_len = len(answer_ids)
         
-        # Find actual sequence lengths (excluding padding)
-        teacher_len = (teacher_enc["attention_mask"].squeeze() == 1).sum().item()
-        student_len = (student_enc["attention_mask"].squeeze() == 1).sum().item()
+        # Actual sequence lengths
+        teacher_len = teacher_enc["input_ids"].shape[1]
+        student_len = student_enc["input_ids"].shape[1]
         
         return {
-            "teacher_ids": teacher_enc["input_ids"].squeeze(),
-            "teacher_mask": teacher_enc["attention_mask"].squeeze(),
-            "student_ids": student_enc["input_ids"].squeeze(),
-            "student_mask": student_enc["attention_mask"].squeeze(),
+            "teacher_ids": teacher_enc["input_ids"].squeeze(0),
+            "teacher_mask": teacher_enc["attention_mask"].squeeze(0),
+            "student_ids": student_enc["input_ids"].squeeze(0),
+            "student_mask": student_enc["attention_mask"].squeeze(0),
             "teacher_len": teacher_len,
             "student_len": student_len,
             "answer_len": answer_len,
         }
+
+
+def collate_fn(batch):
+    """Custom collate function with dynamic padding."""
+    # Find max lengths in this batch
+    max_teacher_len = max(item["teacher_len"] for item in batch)
+    max_student_len = max(item["student_len"] for item in batch)
+    
+    teacher_ids_list = []
+    teacher_mask_list = []
+    student_ids_list = []
+    student_mask_list = []
+    teacher_lens = []
+    student_lens = []
+    answer_lens = []
+    
+    for item in batch:
+        # Pad teacher
+        t_ids = item["teacher_ids"]
+        t_mask = item["teacher_mask"]
+        t_pad_len = max_teacher_len - len(t_ids)
+        if t_pad_len > 0:
+            t_ids = F.pad(t_ids, (0, t_pad_len), value=0)
+            t_mask = F.pad(t_mask, (0, t_pad_len), value=0)
+        teacher_ids_list.append(t_ids)
+        teacher_mask_list.append(t_mask)
+        
+        # Pad student
+        s_ids = item["student_ids"]
+        s_mask = item["student_mask"]
+        s_pad_len = max_student_len - len(s_ids)
+        if s_pad_len > 0:
+            s_ids = F.pad(s_ids, (0, s_pad_len), value=0)
+            s_mask = F.pad(s_mask, (0, s_pad_len), value=0)
+        student_ids_list.append(s_ids)
+        student_mask_list.append(s_mask)
+        
+        teacher_lens.append(item["teacher_len"])
+        student_lens.append(item["student_len"])
+        answer_lens.append(item["answer_len"])
+    
+    return {
+        "teacher_ids": torch.stack(teacher_ids_list),
+        "teacher_mask": torch.stack(teacher_mask_list),
+        "student_ids": torch.stack(student_ids_list),
+        "student_mask": torch.stack(student_mask_list),
+        "teacher_len": teacher_lens,
+        "student_len": student_lens,
+        "answer_len": answer_lens,
+    }
 
 
 class LearnableCoTVector(BaseCoTVectorMethod):
@@ -106,8 +155,9 @@ class LearnableCoTVector(BaseCoTVectorMethod):
         weight_decay: float = 1e-3,
         warmup_ratio: float = 0.1,
         num_epochs: int = 5,
-        batch_size: int = 4,
-        gradient_accumulation_steps: int = 2,
+        batch_size: int = 2,  # Reduced default batch size
+        gradient_accumulation_steps: int = 4,  # Increased accumulation
+        max_length: int = 1024,  # Reduced max length
     ):
         super().__init__(model_wrapper, tokenizer, layer_idx, dataset_type)
         
@@ -118,6 +168,7 @@ class LearnableCoTVector(BaseCoTVectorMethod):
         self.num_epochs = num_epochs
         self.batch_size = batch_size
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.max_length = max_length
         
         # Initialize learnable vector
         hidden_size = model_wrapper.hidden_size
@@ -129,15 +180,10 @@ class LearnableCoTVector(BaseCoTVectorMethod):
         teacher_hidden: torch.Tensor,
         student_hidden: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute KL divergence alignment loss."""
-        # Normalize for stable KL computation
-        teacher_norm = F.softmax(teacher_hidden.float(), dim=-1)
-        student_norm = F.log_softmax(student_hidden.float(), dim=-1)
-        
-        # KL divergence
-        kl_loss = F.kl_div(student_norm, teacher_norm, reduction='batchmean')
-        
-        return kl_loss
+        """Compute MSE alignment loss (more memory efficient than KL)."""
+        # Simple MSE loss for alignment
+        loss = F.mse_loss(student_hidden, teacher_hidden.detach())
+        return loss
     
     def _compute_ce_loss(
         self,
@@ -155,7 +201,7 @@ class LearnableCoTVector(BaseCoTVectorMethod):
         vocab_size = shift_logits.size(-1)
         flat_logits = shift_logits.view(-1, vocab_size)
         flat_labels = shift_labels.view(-1)
-        flat_mask = shift_mask.view(-1)
+        flat_mask = shift_mask.view(-1).float()
         
         # Compute loss only on masked positions
         ce_loss = F.cross_entropy(flat_logits, flat_labels, reduction='none')
@@ -172,16 +218,29 @@ class LearnableCoTVector(BaseCoTVectorMethod):
         print(f"Training learnable vector at layer {self.layer_idx}...")
         print(f"  Samples: {len(support_samples)}, Epochs: {self.num_epochs}")
         print(f"  LR: {self.learning_rate}, λ: {self.lambda_val}")
+        print(f"  Batch size: {self.batch_size}, Grad accum: {self.gradient_accumulation_steps}")
+        print(f"  Max length: {self.max_length}")
         
         # Create dataset and dataloader
-        dataset = CoTDataset(support_samples, self.tokenizer, self.dataset_type)
+        dataset = CoTDataset(
+            support_samples, 
+            self.tokenizer, 
+            self.dataset_type,
+            max_length=self.max_length
+        )
         dataloader = DataLoader(
             dataset, 
             batch_size=self.batch_size, 
             shuffle=True,
             num_workers=0,
-            pin_memory=True,
+            pin_memory=False,  # Disable pin_memory to reduce memory
+            collate_fn=collate_fn,
         )
+        
+        # Get target device for vector
+        target_layer = self.model_wrapper._get_layer(self.layer_idx)
+        target_device = next(target_layer.parameters()).device
+        self.vector_param.data = self.vector_param.data.to(target_device)
         
         # Setup optimizer
         optimizer = torch.optim.AdamW(
@@ -202,11 +261,6 @@ class LearnableCoTVector(BaseCoTVectorMethod):
         
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         
-        # Get target device for vector
-        target_layer = self.model_wrapper._get_layer(self.layer_idx)
-        target_device = next(target_layer.parameters()).device
-        self.vector_param.data = self.vector_param.data.to(target_device)
-        
         # Training loop
         global_step = 0
         best_loss = float('inf')
@@ -217,102 +271,165 @@ class LearnableCoTVector(BaseCoTVectorMethod):
             epoch_ce = 0.0
             num_batches = 0
             
+            optimizer.zero_grad()
+            
             pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.num_epochs}", ncols=100)
             
             for batch_idx, batch in enumerate(pbar):
-                # Move to device
-                teacher_ids = batch["teacher_ids"].to(target_device)
-                teacher_mask = batch["teacher_mask"].to(target_device)
-                student_ids = batch["student_ids"].to(target_device)
-                student_mask = batch["student_mask"].to(target_device)
-                
-                # Teacher forward (frozen)
-                self.model_wrapper.clear_hooks()
-                self.model_wrapper.register_extraction_hook(self.layer_idx)
-                
-                with torch.no_grad():
-                    teacher_outputs = self.model_wrapper(teacher_ids, attention_mask=teacher_mask)
-                teacher_hidden = self.model_wrapper.get_activations(self.layer_idx)
-                
-                # Student forward with injection
-                self.model_wrapper.clear_hooks()
-                self.model_wrapper.register_injection_hook(
-                    self.layer_idx, 
-                    self.vector_param,
-                    scaling_factor=1.0,
-                    requires_grad=True
-                )
-                self.model_wrapper.register_extraction_hook(self.layer_idx)
-                
-                student_outputs = self.model_wrapper(student_ids, attention_mask=student_mask)
-                student_hidden = self.model_wrapper.get_activations(self.layer_idx)
-                student_logits = student_outputs.logits
-                
-                # Get answer positions
-                bs = teacher_ids.size(0)
-                align_losses = []
-                ce_losses = []
-                
-                for i in range(bs):
-                    t_len = batch["teacher_len"][i].item()
-                    s_len = batch["student_len"][i].item()
-                    a_len = batch["answer_len"][i].item()
+                try:
+                    # Move to device
+                    teacher_ids = batch["teacher_ids"].to(target_device)
+                    teacher_mask = batch["teacher_mask"].to(target_device)
+                    student_ids = batch["student_ids"].to(target_device)
+                    student_mask = batch["student_mask"].to(target_device)
                     
-                    # Answer token positions
-                    t_ans_pos = list(range(max(0, t_len - a_len), t_len))
-                    s_ans_pos = list(range(max(0, s_len - a_len), s_len))
+                    bs = teacher_ids.size(0)
                     
-                    if len(t_ans_pos) > 0 and len(s_ans_pos) > 0:
-                        t_hidden = teacher_hidden[i, t_ans_pos, :].mean(dim=0)
-                        s_hidden = student_hidden[i, s_ans_pos, :].mean(dim=0)
-                        align_losses.append(self._compute_alignment_loss(
-                            t_hidden.unsqueeze(0), s_hidden.unsqueeze(0)
-                        ))
+                    # ========== Teacher forward (frozen, no grad) ==========
+                    self.model_wrapper.clear_hooks()
+                    self.model_wrapper.register_extraction_hook(
+                        self.layer_idx, 
+                        requires_grad=False  # No grad for teacher
+                    )
+                    
+                    with torch.no_grad():
+                        self.model_wrapper(teacher_ids, attention_mask=teacher_mask)
+                    
+                    # Get teacher hidden states and immediately detach/clone
+                    teacher_hidden_raw = self.model_wrapper.get_activations(self.layer_idx)
+                    
+                    # Extract answer positions for teacher
+                    teacher_answer_hiddens = []
+                    for i in range(bs):
+                        t_len = batch["teacher_len"][i]
+                        a_len = batch["answer_len"][i]
+                        t_ans_pos = list(range(max(0, t_len - a_len), t_len))
+                        if t_ans_pos:
+                            h = teacher_hidden_raw[i, t_ans_pos, :].mean(dim=0)
+                            teacher_answer_hiddens.append(h)
+                    
+                    # Clear teacher activations to free memory
+                    self.model_wrapper.clear_hooks()
+                    del teacher_hidden_raw
+                    
+                    if not teacher_answer_hiddens:
+                        continue
+                    
+                    teacher_hidden = torch.stack(teacher_answer_hiddens)  # [valid_bs, hidden]
+                    del teacher_answer_hiddens
+                    
+                    # ========== Student forward (with injection, need grad) ==========
+                    self.model_wrapper.register_injection_hook(
+                        self.layer_idx, 
+                        self.vector_param,
+                        scaling_factor=1.0,
+                        requires_grad=True  # Need grad for training
+                    )
+                    self.model_wrapper.register_extraction_hook(
+                        self.layer_idx,
+                        requires_grad=True  # Need grad for alignment loss
+                    )
+                    
+                    student_outputs = self.model_wrapper(student_ids, attention_mask=student_mask)
+                    student_hidden_raw = self.model_wrapper.get_activations(self.layer_idx)
+                    student_logits = student_outputs.logits
+                    
+                    # Extract answer positions for student
+                    student_answer_hiddens = []
+                    ce_losses = []
+                    valid_indices = []
+                    
+                    for i in range(bs):
+                        s_len = batch["student_len"][i]
+                        a_len = batch["answer_len"][i]
+                        s_ans_pos = list(range(max(0, s_len - a_len), s_len))
                         
-                        # CE loss
-                        ans_mask = torch.zeros_like(student_mask[i])
-                        ans_mask[s_ans_pos] = 1
-                        ce_loss = self._compute_ce_loss(
-                            student_logits[i:i+1],
-                            student_ids[i:i+1],
-                            ans_mask.unsqueeze(0)
-                        )
-                        ce_losses.append(ce_loss)
-                
-                if not align_losses:
-                    continue
-                
-                # Combine losses
-                align_loss = torch.stack(align_losses).mean()
-                ce_loss = torch.stack(ce_losses).mean() if ce_losses else torch.tensor(0.0, device=target_device)
-                
-                loss = align_loss + self.lambda_val * ce_loss
-                loss = loss / self.gradient_accumulation_steps
-                
-                # Backward
-                loss.backward()
-                
-                # Gradient accumulation
-                if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_([self.vector_param], 1.0)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-                    global_step += 1
-                
-                # Track losses
-                epoch_loss += loss.item() * self.gradient_accumulation_steps
-                epoch_align += align_loss.item()
-                epoch_ce += ce_loss.item()
-                num_batches += 1
-                
-                # Update progress
-                pbar.set_postfix({
-                    "loss": f"{epoch_loss/num_batches:.4f}",
-                    "lr": f"{scheduler.get_last_lr()[0]:.2e}"
-                })
-                
-                self.model_wrapper.clear_hooks()
+                        if s_ans_pos and i < len(teacher_hidden):
+                            h = student_hidden_raw[i, s_ans_pos, :].mean(dim=0)
+                            student_answer_hiddens.append(h)
+                            valid_indices.append(i)
+                            
+                            # CE loss for this sample
+                            ans_mask = torch.zeros(student_mask.shape[1], device=target_device)
+                            ans_mask[s_ans_pos] = 1
+                            ce_loss = self._compute_ce_loss(
+                                student_logits[i:i+1],
+                                student_ids[i:i+1],
+                                ans_mask.unsqueeze(0)
+                            )
+                            ce_losses.append(ce_loss)
+                    
+                    if not student_answer_hiddens:
+                        self.model_wrapper.clear_hooks()
+                        continue
+                    
+                    student_hidden = torch.stack(student_answer_hiddens)  # [valid_bs, hidden]
+                    
+                    # Filter teacher hidden to match valid indices
+                    teacher_hidden_filtered = teacher_hidden[:len(student_hidden)]
+                    
+                    # ========== Compute losses ==========
+                    # Alignment loss
+                    align_loss = self._compute_alignment_loss(teacher_hidden_filtered, student_hidden)
+                    
+                    # CE loss
+                    ce_loss = torch.stack(ce_losses).mean() if ce_losses else torch.tensor(0.0, device=target_device)
+                    
+                    # Combined loss
+                    loss = align_loss + self.lambda_val * ce_loss
+                    loss = loss / self.gradient_accumulation_steps
+                    
+                    # Backward
+                    loss.backward()
+                    
+                    # Clear hooks and intermediate tensors
+                    self.model_wrapper.clear_hooks()
+                    del student_hidden_raw, student_logits, student_outputs
+                    del teacher_hidden, student_hidden, teacher_hidden_filtered
+                    del student_answer_hiddens, ce_losses
+                    
+                    # Gradient accumulation step
+                    if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                        torch.nn.utils.clip_grad_norm_([self.vector_param], 1.0)
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad()
+                        global_step += 1
+                        
+                        # Clear CUDA cache periodically
+                        if global_step % 10 == 0:
+                            torch.cuda.empty_cache()
+                    
+                    # Track losses
+                    epoch_loss += loss.item() * self.gradient_accumulation_steps
+                    epoch_align += align_loss.item()
+                    epoch_ce += ce_loss.item()
+                    num_batches += 1
+                    
+                    # Update progress
+                    pbar.set_postfix({
+                        "loss": f"{epoch_loss/num_batches:.4f}",
+                        "lr": f"{scheduler.get_last_lr()[0]:.2e}"
+                    })
+                    
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        # Handle OOM gracefully
+                        print(f"\n  Warning: OOM at batch {batch_idx}, clearing cache and skipping...")
+                        self.model_wrapper.clear_hooks()
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        optimizer.zero_grad()
+                        continue
+                    else:
+                        raise
+            
+            # End of epoch: ensure optimizer step for remaining gradients
+            if (batch_idx + 1) % self.gradient_accumulation_steps != 0:
+                torch.nn.utils.clip_grad_norm_([self.vector_param], 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
             
             # Epoch summary
             avg_loss = epoch_loss / max(num_batches, 1)
@@ -334,6 +451,10 @@ class LearnableCoTVector(BaseCoTVectorMethod):
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 self.vector = self.vector_param.detach().clone()
+            
+            # Clear cache at end of epoch
+            torch.cuda.empty_cache()
+            gc.collect()
         
         # Final vector
         if self.vector is None:

@@ -1,6 +1,8 @@
 """
 Main entry point for CoT Vectors reproduction.
 Extended with Self-Evolved CoT Vector (GRPO) support.
+
+优化版本 - 支持新的self-evolved参数
 """
 
 import os
@@ -36,14 +38,30 @@ def main():
     print(f"Beams: {args.num_beams}, Max tokens: {args.max_new_tokens}")
     
     # Print method-specific config
+    if args.method == "learnable":
+        print("-" * 60)
+        print("Learnable Configuration:")
+        print(f"  Epochs: {args.num_epochs}")
+        print(f"  Batch size: {args.batch_size}")
+        print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
+        print(f"  Learning rate: {args.learning_rate}")
+        print(f"  Lambda: {args.lambda_val}")
+        print(f"  Max length: {args.max_length}")
+    
     if args.method == "self_evolved":
         print("-" * 60)
-        print("Self-Evolved (GRPO) Configuration:")
+        print("Self-Evolved (GRPO) Configuration (Optimized):")
         print(f"  Group size (G): {args.group_size}")
         print(f"  Iterations: {args.num_iterations}")
         print(f"  Questions/iter: {args.questions_per_iter}")
         print(f"  Learning rate: {args.grpo_lr}")
         print(f"  Temperature: {args.temperature}")
+        print(f"  Init std: {args.init_std}")
+        print(f"  Soft reward: {args.use_soft_reward and not args.no_soft_reward}")
+        print(f"  Exploration noise: {args.exploration_noise}")
+        print(f"  Gradient accumulation: {args.grpo_gradient_accumulation}")
+        if args.init_from_extracted:
+            print(f"  Init from extracted: {args.init_from_extracted}")
     
     print("=" * 60)
     
@@ -110,11 +128,30 @@ def main():
                 num_epochs=args.num_epochs,
                 batch_size=args.batch_size,
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
+                max_length=args.max_length,
             )
             vector = method.train(support_samples, wandb_run)
             
         elif args.method == "self_evolved":
-            print("Training Self-Evolved CoT Vector via GRPO...")
+            print("Training Self-Evolved CoT Vector via GRPO (Optimized)...")
+            
+            # 处理从extracted vector初始化
+            init_vector = None
+            if args.init_from_extracted:
+                if os.path.exists(args.init_from_extracted):
+                    print(f"Loading extracted vector from {args.init_from_extracted}")
+                    init_vector = torch.load(args.init_from_extracted)
+                    if isinstance(init_vector, dict):
+                        init_vector = init_vector.get("vector", init_vector)
+                    print(f"  Extracted vector norm: {init_vector.norm().item():.4f}")
+                else:
+                    print(f"Warning: {args.init_from_extracted} not found, using random init")
+            
+            # 处理soft_reward开关
+            use_soft_reward = args.use_soft_reward and not args.no_soft_reward
+            
+            # 使用grpo_max_new_tokens或max_new_tokens
+            grpo_tokens = getattr(args, 'grpo_max_new_tokens', args.max_new_tokens)
             
             # Use V2 (enhanced version) by default
             method = SelfEvolvedCoTVectorV2(
@@ -127,9 +164,16 @@ def main():
                 learning_rate=args.grpo_lr,
                 beta=args.beta,
                 epsilon=args.epsilon,
-                max_new_tokens=args.max_new_tokens,
+                max_new_tokens=grpo_tokens,  # 使用专门的参数
                 questions_per_iter=args.questions_per_iter,
                 temperature=args.temperature,
+                # 新增参数
+                init_std=args.init_std,
+                init_from_extracted=init_vector,
+                use_soft_reward=use_soft_reward,
+                exploration_noise=args.exploration_noise,
+                gradient_accumulation=args.grpo_gradient_accumulation,
+                max_log_prob_tokens=getattr(args, 'max_log_prob_tokens', 128),
             )
             vector = method.train(support_samples, wandb_run)
         
@@ -151,6 +195,7 @@ def main():
         print("=" * 60)
         
         # Baseline evaluation
+        baseline_results = None
         if not args.skip_baseline:
             print("\n[1/2] Baseline (no injection)...")
             baseline_results = run_baseline_evaluation(
@@ -190,25 +235,37 @@ def main():
         print(f"Dataset:    {args.dataset}")
         print(f"Test size:  {len(test_samples)}")
         print("-" * 60)
-        print(f"Baseline:   {baseline_results['accuracy']:.2f}% ({baseline_results['correct']}/{baseline_results['total']})")
+        
+        if baseline_results:
+            print(f"Baseline:   {baseline_results['accuracy']:.2f}% ({baseline_results['correct']}/{baseline_results['total']})")
         
         if injection_results:
-            diff = injection_results['accuracy'] - baseline_results['accuracy']
-            sign = "+" if diff >= 0 else ""
-            print(f"Injection:  {injection_results['accuracy']:.2f}% ({injection_results['correct']}/{injection_results['total']}) [{sign}{diff:.2f}%]")
+            if baseline_results:
+                diff = injection_results['accuracy'] - baseline_results['accuracy']
+                sign = "+" if diff >= 0 else ""
+                print(f"Injection:  {injection_results['accuracy']:.2f}% ({injection_results['correct']}/{injection_results['total']}) [{sign}{diff:.2f}%]")
+            else:
+                print(f"Injection:  {injection_results['accuracy']:.2f}% ({injection_results['correct']}/{injection_results['total']})")
+        
+        if vector is not None:
+            print(f"Vec norm:   {vector.norm().item():.4f}")
         
         print("=" * 60)
         
         # Log to WandB
         if wandb_run:
-            wandb_run.log({
-                "eval/baseline_accuracy": baseline_results['accuracy'],
-            })
-            if injection_results:
+            if baseline_results:
                 wandb_run.log({
-                    "eval/injection_accuracy": injection_results['accuracy'],
-                    "eval/improvement": injection_results['accuracy'] - baseline_results['accuracy'],
+                    "eval/baseline_accuracy": baseline_results['accuracy'],
                 })
+            if injection_results:
+                log_dict = {
+                    "eval/injection_accuracy": injection_results['accuracy'],
+                    "eval/vector_norm": vector.norm().item() if vector is not None else 0,
+                }
+                if baseline_results:
+                    log_dict["eval/improvement"] = injection_results['accuracy'] - baseline_results['accuracy']
+                wandb_run.log(log_dict)
             wandb_run.finish()
     
     print("\nDone!")

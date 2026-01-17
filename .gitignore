@@ -1,0 +1,39 @@
+# 忽略 Python 编译缓存
+__pycache__/
+src/__pycache__/
+src/methods/__pycache__/
+*.py[cod]
+
+# 忽略巨大的数据文件夹 (根据你的实际情况修改名字)
+data/
+dataset/
+datasets/
+
+# 忽略模型权重文件 (太大了传不上去)
+*.pth
+*.pt
+*.ckpt
+*.weights
+*.onnx
+models/
+wandb/
+*.safetensors
+*.bin
+
+# 忽略日志和临时文件
+logs/
+*.log
+.DS_Store
+.vscode/
+*.pyc
+
+# 忽略实验输出
+outputs/
+sweep_outputs/
+
+# 忽略隐私文件
+config/
+
+# 忽略指定文件
+pack_code.py
+project_context.txt

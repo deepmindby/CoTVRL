@@ -55,8 +55,20 @@ class CoTModelWrapper(nn.Module):
         else:
             raise ValueError(f"Unknown model: {self.model_name}")
     
-    def register_extraction_hook(self, layer_idx: int, position_ids: Optional[torch.Tensor] = None):
-        """Register hook to extract activations at specified layer."""
+    def register_extraction_hook(
+        self, 
+        layer_idx: int, 
+        position_ids: Optional[torch.Tensor] = None,
+        requires_grad: bool = False
+    ):
+        """
+        Register hook to extract activations at specified layer.
+        
+        Args:
+            layer_idx: Layer index to extract from
+            position_ids: Optional position indices to extract
+            requires_grad: If True, keep gradients for training. If False, detach.
+        """
         layer = self._get_layer(layer_idx)
         
         def hook_fn(module, input, output):
@@ -66,14 +78,19 @@ class CoTModelWrapper(nn.Module):
             else:
                 hidden_states = output
             
-            # Store activation (detached, float32 for numerical stability)
+            # Extract at specified positions or all
             if position_ids is not None:
-                # Extract only at specified positions
-                extracted = hidden_states[:, position_ids, :].detach().float()
+                extracted = hidden_states[:, position_ids, :]
             else:
-                extracted = hidden_states.detach().float()
+                extracted = hidden_states
             
-            self._activations[layer_idx] = extracted
+            # Convert to float32 for numerical stability
+            if requires_grad:
+                # Keep gradients for training - don't detach
+                self._activations[layer_idx] = extracted.float()
+            else:
+                # Detach for inference to save memory
+                self._activations[layer_idx] = extracted.detach().float()
         
         handle = layer.register_forward_hook(hook_fn)
         self._hooks.append(handle)
@@ -92,26 +109,28 @@ class CoTModelWrapper(nn.Module):
         """
         layer = self._get_layer(layer_idx)
         
-        # Pre-convert vector to target layer's device and dtype
+        # Get target device and dtype
         target_device = next(layer.parameters()).device
         target_dtype = next(layer.parameters()).dtype
         
         if requires_grad:
-            # For training: keep as parameter, will be converted in hook
-            vector_scaled = scaling_factor * vector
+            # For training: store the original vector reference to maintain gradient connection
+            # We'll do dtype conversion in the hook to maintain the computation graph
+            self._injection_vector_raw = vector
+            self._injection_scaling_factor = scaling_factor
         else:
-            # For inference: pre-convert and cache
+            # For inference: pre-convert and cache for efficiency
             vector_scaled = scaling_factor * vector.to(device=target_device, dtype=target_dtype)
             if vector_scaled.dim() == 1:
                 vector_scaled = vector_scaled.unsqueeze(0).unsqueeze(0)
             elif vector_scaled.dim() == 2:
                 vector_scaled = vector_scaled.unsqueeze(0)
+            self._injection_vector_cached = vector_scaled
         
-        # Store cached vector
-        object.__setattr__(self, '_injection_vector_cached', vector_scaled)
-        object.__setattr__(self, '_injection_requires_grad', requires_grad)
-        object.__setattr__(self, '_injection_target_device', target_device)
-        object.__setattr__(self, '_injection_target_dtype', target_dtype)
+        # Store flags
+        self._injection_requires_grad = requires_grad
+        self._injection_target_device = target_device
+        self._injection_target_dtype = target_dtype
         
         def hook_fn(module, input, output):
             if isinstance(output, tuple):
@@ -121,11 +140,10 @@ class CoTModelWrapper(nn.Module):
                 hidden_states = output
                 rest = None
             
-            cached = self._injection_vector_cached
-            
             if self._injection_requires_grad:
-                # Training: convert on-the-fly to maintain gradient
-                vec = cached.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                # Training: compute on-the-fly to maintain gradient flow
+                vec = self._injection_scaling_factor * self._injection_vector_raw
+                vec = vec.to(device=hidden_states.device, dtype=hidden_states.dtype)
                 if vec.dim() == 1:
                     vec = vec.unsqueeze(0).unsqueeze(0)
                 elif vec.dim() == 2:
@@ -133,7 +151,7 @@ class CoTModelWrapper(nn.Module):
                 modified = hidden_states + vec.expand_as(hidden_states)
             else:
                 # Inference: use pre-cached vector
-                modified = hidden_states + cached.expand_as(hidden_states)
+                modified = hidden_states + self._injection_vector_cached.expand_as(hidden_states)
             
             if rest is not None:
                 return (modified,) + rest
@@ -148,12 +166,18 @@ class CoTModelWrapper(nn.Module):
         return self._activations.get(layer_idx)
     
     def clear_hooks(self):
-        """Remove all registered hooks."""
+        """Remove all registered hooks and clear cached data."""
         for handle in self._hooks:
             handle.remove()
         self._hooks.clear()
         self._activations.clear()
-        object.__setattr__(self, '_injection_vector_cached', None)
+        
+        # Clear injection-related attributes
+        self._injection_vector_cached = None
+        if hasattr(self, '_injection_vector_raw'):
+            self._injection_vector_raw = None
+        if hasattr(self, '_injection_scaling_factor'):
+            self._injection_scaling_factor = None
     
     def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, **kwargs):
         """Forward pass through the model."""
