@@ -1,8 +1,8 @@
 """
 Main entry point for CoT Vectors reproduction.
-Extended with Self-Evolved CoT Vector (GRPO) support.
+Supports extracted, learnable, and self_evolved (RL-based) methods.
 
-优化版本 - 支持新的self-evolved参数
+Refactored version - Clean integration with RL solvers.
 """
 
 import os
@@ -14,7 +14,7 @@ from src.models import CoTModelWrapper, load_tokenizer
 from src.data_utils import load_dataset
 from src.methods.extracted import ExtractedCoTVector
 from src.methods.learnable import LearnableCoTVector
-from src.methods.self_evolved import SelfEvolvedCoTVector, SelfEvolvedCoTVectorV2
+from src.methods.self_evolved import SelfEvolvedCoTVector
 from src.eval import run_baseline_evaluation, run_injection_evaluation
 from src.utils import set_seed, setup_wandb
 
@@ -50,18 +50,17 @@ def main():
     
     if args.method == "self_evolved":
         print("-" * 60)
-        print("Self-Evolved (GRPO) Configuration (Optimized):")
-        print(f"  Group size (G): {args.group_size}")
+        print(f"Self-Evolved ({args.rl_method.upper()}) Configuration:")
+        print(f"  RL Method: {args.rl_method}")
+        print(f"  Rollouts (G): {args.num_rollouts}")
         print(f"  Iterations: {args.num_iterations}")
         print(f"  Questions/iter: {args.questions_per_iter}")
-        print(f"  Learning rate: {args.grpo_lr}")
+        print(f"  Learning rate: {args.learning_rate_vector}")
         print(f"  Temperature: {args.temperature}")
-        print(f"  Init std: {args.init_std}")
-        print(f"  Soft reward: {args.use_soft_reward and not args.no_soft_reward}")
-        print(f"  Exploration noise: {args.exploration_noise}")
-        print(f"  Gradient accumulation: {args.grpo_gradient_accumulation}")
-        if args.init_from_extracted:
-            print(f"  Init from extracted: {args.init_from_extracted}")
+        print(f"  Soft reward: {args.soft_reward}")
+        print(f"  Init from extracted: {args.init_from_extracted}")
+        if args.init_std > 0:
+            print(f"  Init std: {args.init_std}")
     
     print("=" * 60)
     
@@ -98,8 +97,12 @@ def main():
     
     if args.vector_path:
         print(f"\nLoading vector from {args.vector_path}")
-        vector = torch.load(args.vector_path)
-        print(f"Loaded vector: shape={vector.shape}")
+        loaded = torch.load(args.vector_path)
+        if isinstance(loaded, dict) and "vector" in loaded:
+            vector = loaded["vector"]
+        else:
+            vector = loaded
+        print(f"Loaded vector: shape={vector.shape}, norm={vector.norm().item():.4f}")
     
     elif args.mode in ["extract", "train", "both"]:
         print(f"\n{'='*60}")
@@ -133,47 +136,28 @@ def main():
             vector = method.train(support_samples, wandb_run)
             
         elif args.method == "self_evolved":
-            print("Training Self-Evolved CoT Vector via GRPO (Optimized)...")
+            print(f"Training Self-Evolved CoT Vector via {args.rl_method.upper()}...")
             
-            # 处理从extracted vector初始化
-            init_vector = None
-            if args.init_from_extracted:
-                if os.path.exists(args.init_from_extracted):
-                    print(f"Loading extracted vector from {args.init_from_extracted}")
-                    init_vector = torch.load(args.init_from_extracted)
-                    if isinstance(init_vector, dict):
-                        init_vector = init_vector.get("vector", init_vector)
-                    print(f"  Extracted vector norm: {init_vector.norm().item():.4f}")
-                else:
-                    print(f"Warning: {args.init_from_extracted} not found, using random init")
-            
-            # 处理soft_reward开关
-            use_soft_reward = args.use_soft_reward and not args.no_soft_reward
-            
-            # 使用grpo_max_new_tokens或max_new_tokens
-            grpo_tokens = getattr(args, 'grpo_max_new_tokens', args.max_new_tokens)
-            
-            # Use V2 (enhanced version) by default
-            method = SelfEvolvedCoTVectorV2(
+            method = SelfEvolvedCoTVector(
                 model_wrapper=model_wrapper,
                 tokenizer=tokenizer,
                 layer_idx=args.layer_idx,
                 dataset_type=args.dataset,
-                group_size=args.group_size,
-                num_iterations=args.num_iterations,
-                learning_rate=args.grpo_lr,
-                beta=args.beta,
-                epsilon=args.epsilon,
-                max_new_tokens=grpo_tokens,  # 使用专门的参数
-                questions_per_iter=args.questions_per_iter,
-                temperature=args.temperature,
-                # 新增参数
+                # RL configuration
+                rl_method=args.rl_method,
+                soft_reward=args.soft_reward,
+                init_from_extracted=args.init_from_extracted,
+                extracted_vector_path=args.extracted_vector_path,
                 init_std=args.init_std,
-                init_from_extracted=init_vector,
-                use_soft_reward=use_soft_reward,
-                exploration_noise=args.exploration_noise,
-                gradient_accumulation=args.grpo_gradient_accumulation,
-                max_log_prob_tokens=getattr(args, 'max_log_prob_tokens', 128),
+                num_rollouts=args.num_rollouts,
+                beta=args.beta,
+                learning_rate_vector=args.learning_rate_vector,
+                max_grad_norm=args.max_grad_norm,
+                num_iterations=args.num_iterations,
+                questions_per_iter=args.questions_per_iter,
+                rl_max_new_tokens=args.rl_max_new_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
             )
             vector = method.train(support_samples, wandb_run)
         
@@ -185,7 +169,7 @@ def main():
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             vector_filename = f"{args.method}_{args.dataset}_L{args.layer_idx}_{timestamp}.pt"
             vector_path = os.path.join(args.output_dir, vector_filename)
-            torch.save(vector.cpu(), vector_path)
+            torch.save({"vector": vector.cpu(), "args": vars(args)}, vector_path)
             print(f"Vector saved to {vector_path}")
     
     # Evaluation
@@ -231,6 +215,8 @@ def main():
         print("-" * 60)
         print(f"Model:      {args.model_path.split('/')[-1]}")
         print(f"Method:     {args.method}")
+        if args.method == "self_evolved":
+            print(f"RL Method:  {args.rl_method.upper()}")
         print(f"Layer:      {args.layer_idx}")
         print(f"Dataset:    {args.dataset}")
         print(f"Test size:  {len(test_samples)}")

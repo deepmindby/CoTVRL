@@ -1,9 +1,9 @@
 """
 Argument parser for CoT Vectors reproduction.
 All hyperparameters follow the paper's Appendix A.2.
-Extended with Self-Evolved CoT Vector (GRPO) configuration.
+Extended with Self-Evolved CoT Vector (GRPO/DAPO) configuration.
 
-优化版本 - 更新了self-evolved方法的默认参数
+Refactored version - Clean RL-based task vector search.
 """
 
 import argparse
@@ -148,14 +148,71 @@ def parse_args():
         help="Maximum sequence length for learnable method"
     )
     
-    # ==================== Self-Evolved Vector Configuration (GRPO) ====================
-    # 显存优化后的默认参数
+    # ==================== Self-Evolved Vector Configuration (RL-based) ====================
+    # Core RL method selection
     parser.add_argument(
-        "--group_size",
-        type=int,
-        default=4,  # 减小以节省显存
-        help="Number of samples generated per question (Group size G in GRPO)"
+        "--rl_method",
+        type=str,
+        default="grpo",
+        choices=["grpo", "dapo"],
+        help="RL algorithm for self-evolved vector training (GRPO or DAPO)"
     )
+    
+    # Reward configuration
+    parser.add_argument(
+        "--soft_reward",
+        action="store_true",
+        default=False,
+        help="If True, give partial rewards for format/length; if False, binary 0/1 for correctness"
+    )
+    
+    # Vector initialization
+    parser.add_argument(
+        "--init_from_extracted",
+        action="store_true",
+        default=False,
+        help="If True, load pre-calculated vector from extracted_vectors/ path; otherwise init with zeros"
+    )
+    parser.add_argument(
+        "--extracted_vector_path",
+        type=str,
+        default=None,
+        help="Path to extracted vector file for initialization (used with --init_from_extracted)"
+    )
+    parser.add_argument(
+        "--init_std",
+        type=float,
+        default=0.0,
+        help="Std for random initialization (0.0 means zero init, >0 means normal init)"
+    )
+    
+    # GRPO/DAPO specific parameters
+    parser.add_argument(
+        "--num_rollouts",
+        type=int,
+        default=8,
+        help="Number of rollouts (group size G) per question"
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=0.0,
+        help="KL penalty coefficient (default off)"
+    )
+    parser.add_argument(
+        "--learning_rate_vector",
+        type=float,
+        default=1e-2,
+        help="Learning rate specifically for vector optimization in RL methods"
+    )
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="Max gradient norm for clipping"
+    )
+    
+    # Training iterations
     parser.add_argument(
         "--num_iterations",
         type=int,
@@ -163,81 +220,33 @@ def parse_args():
         help="Number of training iterations for self-evolved method"
     )
     parser.add_argument(
-        "--beta",
-        type=float,
-        default=0.01,
-        help="KL penalty coefficient for GRPO (reserved for stability)"
-    )
-    parser.add_argument(
-        "--epsilon",
-        type=float,
-        default=1e-8,
-        help="Small value for numerical stability in advantage normalization"
-    )
-    parser.add_argument(
-        "--grpo_lr",
-        type=float,
-        default=5e-3,
-        help="Learning rate specifically for GRPO training"
-    )
-    parser.add_argument(
         "--questions_per_iter",
         type=int,
-        default=2,  # 减小以节省显存
-        help="Number of questions to sample per iteration (batch size for GRPO)"
-    )
-    parser.add_argument(
-        "--grpo_max_new_tokens",
-        type=int,
-        default=256,  # 减小以节省显存
-        help="Max new tokens for GRPO generation (smaller than eval)"
+        default=4,
+        help="Number of questions sampled per iteration"
     )
     
-    # === 新增的Self-Evolved参数 ===
+    # Generation parameters for RL
     parser.add_argument(
-        "--init_std",
-        type=float,
-        default=0.35,
-        help="Initialization std for self-evolved vector (0.35 -> norm≈21 for hidden_size=3584)"
-    )
-    parser.add_argument(
-        "--use_soft_reward",
-        action="store_true",
-        default=True,
-        help="Use continuous soft reward instead of binary reward"
-    )
-    parser.add_argument(
-        "--no_soft_reward",
-        action="store_true",
-        default=False,
-        help="Disable soft reward, use binary reward"
-    )
-    parser.add_argument(
-        "--exploration_noise",
-        type=float,
-        default=0.1,  # 减小: 0.15 -> 0.1
-        help="Exploration noise std added to vector during generation"
-    )
-    parser.add_argument(
-        "--grpo_gradient_accumulation",
+        "--rl_max_new_tokens",
         type=int,
-        default=1,  # 减小以节省显存: 2 -> 1
-        help="Gradient accumulation steps for GRPO"
+        default=512,
+        help="Max new tokens for RL generation"
     )
     parser.add_argument(
-        "--init_from_extracted",
-        type=str,
-        default=None,
-        help="Path to extracted vector to initialize self-evolved training"
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Temperature for sampling during RL"
     )
     parser.add_argument(
-        "--max_log_prob_tokens",
-        type=int,
-        default=128,
-        help="Max tokens used for log_prob calculation (memory optimization)"
+        "--top_p",
+        type=float,
+        default=0.9,
+        help="Top-p (nucleus) sampling parameter"
     )
     
-    # ==================== Generation Configuration ====================
+    # ==================== Generation Configuration (Evaluation) ====================
     parser.add_argument(
         "--max_new_tokens",
         type=int,
@@ -249,12 +258,6 @@ def parse_args():
         type=int,
         default=3,
         help="Number of beams (1=greedy, faster)"
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=1.0,
-        help="Temperature for generation"
     )
     parser.add_argument(
         "--do_sample",
