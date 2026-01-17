@@ -216,7 +216,7 @@ def parse_args():
     parser.add_argument(
         "--num_iterations",
         type=int,
-        default=100,
+        default=20,
         help="Number of training iterations for self-evolved method"
     )
     parser.add_argument(
