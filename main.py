@@ -1,8 +1,6 @@
 """
 Main entry point for CoT Vectors reproduction.
-Supports extracted, learnable, and self_evolved (RL-based) methods.
-
-Refactored version - Clean integration with RL solvers.
+Supports extracted, learnable, and ua_vector (Uncertainty-Aware) methods.
 """
 
 import os
@@ -12,11 +10,9 @@ from datetime import datetime
 from src.args import parse_args
 from src.models import CoTModelWrapper, load_tokenizer
 from src.data_utils import load_dataset
-from src.methods.extracted import ExtractedCoTVector
-from src.methods.learnable import LearnableCoTVector
-from src.methods.self_evolved import SelfEvolvedCoTVector
+from src.methods import METHOD_MAP, ExtractedCoTVector, UncertaintyAwareCoTVector
 from src.eval import run_baseline_evaluation, run_injection_evaluation
-from src.utils import set_seed, setup_wandb
+from src.utils import set_seed, setup_wandb, save_vector, print_results_summary
 
 
 def main():
@@ -38,6 +34,16 @@ def main():
     print(f"Beams: {args.num_beams}, Max tokens: {args.max_new_tokens}")
     
     # Print method-specific config
+    if args.method == "ua_vector":
+        # Handle variance normalization flag
+        normalize_variance = args.ua_normalize_variance and not args.no_ua_normalize_variance
+        print("-" * 60)
+        print("UA-Vector Configuration:")
+        print(f"  Gamma (γ): {args.ua_gamma}")
+        print(f"  Normalize Variance: {normalize_variance}")
+        if args.ua_gamma == 0:
+            print("  Note: γ=0 degrades to standard Extracted Vector")
+    
     if args.method == "learnable":
         print("-" * 60)
         print("Learnable Configuration:")
@@ -47,20 +53,6 @@ def main():
         print(f"  Learning rate: {args.learning_rate}")
         print(f"  Lambda: {args.lambda_val}")
         print(f"  Max length: {args.max_length}")
-    
-    if args.method == "self_evolved":
-        print("-" * 60)
-        print(f"Self-Evolved ({args.rl_method.upper()}) Configuration:")
-        print(f"  RL Method: {args.rl_method}")
-        print(f"  Rollouts (G): {args.num_rollouts}")
-        print(f"  Iterations: {args.num_iterations}")
-        print(f"  Questions/iter: {args.questions_per_iter}")
-        print(f"  Learning rate: {args.learning_rate_vector}")
-        print(f"  Temperature: {args.temperature}")
-        print(f"  Soft reward: {args.soft_reward}")
-        print(f"  Init from extracted: {args.init_from_extracted}")
-        if args.init_std > 0:
-            print(f"  Init std: {args.init_std}")
     
     print("=" * 60)
     
@@ -94,12 +86,14 @@ def main():
     
     # Get or load vector
     vector = None
+    method_stats = None
     
     if args.vector_path:
         print(f"\nLoading vector from {args.vector_path}")
-        loaded = torch.load(args.vector_path)
+        loaded = torch.load(args.vector_path, map_location="cpu")
         if isinstance(loaded, dict) and "vector" in loaded:
             vector = loaded["vector"]
+            method_stats = loaded.get("metadata", {}).get("stats", None)
         else:
             vector = loaded
         print(f"Loaded vector: shape={vector.shape}, norm={vector.norm().item():.4f}")
@@ -117,8 +111,27 @@ def main():
             )
             vector = method.extract(support_samples)
             
+        elif args.method == "ua_vector":
+            print("Extracting Uncertainty-Aware CoT Vector...")
+            # Handle variance normalization flag
+            normalize_variance = args.ua_normalize_variance and not args.no_ua_normalize_variance
+            
+            method = UncertaintyAwareCoTVector(
+                model_wrapper=model_wrapper,
+                tokenizer=tokenizer,
+                layer_idx=args.layer_idx,
+                dataset_type=args.dataset,
+                gamma=args.ua_gamma,
+                normalize_variance=normalize_variance,
+            )
+            vector = method.extract(support_samples, wandb_run)
+            method_stats = method.get_statistics()
+            
         elif args.method == "learnable":
             print("Training Learnable CoT Vector...")
+            # Import learnable method
+            from src.methods.learnable import LearnableCoTVector
+            
             method = LearnableCoTVector(
                 model_wrapper=model_wrapper,
                 tokenizer=tokenizer,
@@ -137,6 +150,8 @@ def main():
             
         elif args.method == "self_evolved":
             print(f"Training Self-Evolved CoT Vector via {args.rl_method.upper()}...")
+            # Import self-evolved method
+            from src.methods.self_evolved import SelfEvolvedCoTVector
             
             method = SelfEvolvedCoTVector(
                 model_wrapper=model_wrapper,
@@ -169,8 +184,18 @@ def main():
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             vector_filename = f"{args.method}_{args.dataset}_L{args.layer_idx}_{timestamp}.pt"
             vector_path = os.path.join(args.output_dir, vector_filename)
-            torch.save({"vector": vector.cpu(), "args": vars(args)}, vector_path)
-            print(f"Vector saved to {vector_path}")
+            
+            # Prepare metadata
+            metadata = {
+                "args": vars(args),
+                "layer_idx": args.layer_idx,
+                "dataset": args.dataset,
+                "method": args.method,
+            }
+            if method_stats:
+                metadata["stats"] = method_stats
+            
+            save_vector(vector, vector_path, metadata)
     
     # Evaluation
     if args.mode in ["eval", "both"] and test_samples:
@@ -215,8 +240,8 @@ def main():
         print("-" * 60)
         print(f"Model:      {args.model_path.split('/')[-1]}")
         print(f"Method:     {args.method}")
-        if args.method == "self_evolved":
-            print(f"RL Method:  {args.rl_method.upper()}")
+        if args.method == "ua_vector":
+            print(f"Gamma (γ):  {args.ua_gamma}")
         print(f"Layer:      {args.layer_idx}")
         print(f"Dataset:    {args.dataset}")
         print(f"Test size:  {len(test_samples)}")
@@ -235,6 +260,17 @@ def main():
         
         if vector is not None:
             print(f"Vec norm:   {vector.norm().item():.4f}")
+        
+        # Print UA-Vector specific stats
+        if args.method == "ua_vector" and method_stats:
+            print("-" * 60)
+            print("UA-Vector Statistics:")
+            print(f"  Original norm:     {method_stats.get('original_vector_norm', 0):.4f}")
+            print(f"  Final norm:        {method_stats.get('final_vector_norm', 0):.4f}")
+            print(f"  Norm reduction:    {method_stats.get('norm_reduction_percent', 0):.1f}%")
+            print(f"  Lambda mean:       {method_stats.get('lambda_mean', 0):.4f}")
+            print(f"  Suppressed dims:   {method_stats.get('suppressed_ratio', 0)*100:.1f}%")
+            print(f"  Preserved dims:    {method_stats.get('preserved_ratio', 0)*100:.1f}%")
         
         print("=" * 60)
         

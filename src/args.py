@@ -2,6 +2,7 @@
 Argument parser for CoT Vectors reproduction.
 All hyperparameters follow the paper's Appendix A.2.
 Extended with Self-Evolved CoT Vector (GRPO/DAPO) configuration.
+Extended with UA-Vector (Uncertainty-Aware) configuration.
 
 Refactored version - Clean RL-based task vector search.
 """
@@ -52,7 +53,7 @@ def parse_args():
         "--method",
         type=str,
         default="extracted",
-        choices=["extracted", "learnable", "self_evolved"],
+        choices=["extracted", "learnable", "self_evolved", "ua_vector"],
         help="CoT Vector acquisition method"
     )
     parser.add_argument(
@@ -310,6 +311,30 @@ def parse_args():
         action="store_true",
         default=True,
         help="Save extracted/learned vector"
+    )
+    
+    # ==================== UA-Vector (Uncertainty-Aware) Configuration ====================
+    parser.add_argument(
+        "--ua_gamma",
+        type=float,
+        default=1.0,
+        help="Noise penalty factor γ for UA-Vector. "
+             "When set to 0, the method degrades to standard Extracted Vector. "
+             "Larger values penalize high-variance (noisy) dimensions more aggressively."
+    )
+    parser.add_argument(
+        "--ua_normalize_variance",
+        action="store_true",
+        default=True,
+        help="Whether to normalize variance σ² within the layer (divide by mean variance). "
+             "This helps make γ more robust across different layers with varying scales."
+    )
+    parser.add_argument(
+        "--no_ua_normalize_variance",
+        action="store_true",
+        default=False,
+        help="Disable variance normalization for UA-Vector. "
+             "Use this flag to turn off the default normalization behavior."
     )
     
     return parser.parse_args()
