@@ -33,12 +33,15 @@ def parse_filename(filename):
         return None
     layer_idx = int(layer_match.group(1))
     
+    # 解析方法名
     if name.startswith("extracted"):
         method = "extracted"
     elif name.startswith("learnable"):
         method = "learnable"
     elif name.startswith("self_evolved"):
         method = "self_evolved"
+    elif name.startswith("ua_vector"):  # [新增] 支持 ua_vector
+        method = "ua_vector"
     else:
         method = "unknown"
         
@@ -53,11 +56,13 @@ def analyze_vector_stats(vector_path, device):
     """统计向量的物理属性：尺寸、范数、分布"""
     try:
         # 加载向量时指定 device，避免跨设备问题
-        vec = torch.load(vector_path, map_location=device)
+        vec_data = torch.load(vector_path, map_location=device)
         
         # 兼容: 如果保存的是dict (包含metadata)，则提取vector字段
-        if isinstance(vec, dict) and "vector" in vec:
-            vec = vec["vector"]
+        if isinstance(vec_data, dict) and "vector" in vec_data:
+            vec = vec_data["vector"]
+        else:
+            vec = vec_data
         
         # 确保是 1D tensor
         if vec.dim() > 1:
@@ -89,8 +94,7 @@ def evaluate_reasoning(model_wrapper, vector, layer_idx, samples, args):
     }
     
     # 注册向量注入 Hook
-    # 注意：根据 models.py 定义，register_injection_hook 需要 vector, scaling_factor, requires_grad
-    # 这里我们只评估，所以 scaling_factor=1.0, requires_grad=False
+    # scaling_factor=1.0, requires_grad=False 用于评估
     hook = model_wrapper.register_injection_hook(layer_idx, vector, scaling_factor=1.0, requires_grad=False)
     
     try:
@@ -101,7 +105,6 @@ def evaluate_reasoning(model_wrapper, vector, layer_idx, samples, args):
             # 构建 Prompt
             prompt = f"Question: {question}\nLet's think step by step."
             
-            # 【修复】显式构建 attention_mask 并移动到正确设备
             inputs = model_wrapper.model.tokenizer(prompt, return_tensors="pt")
             input_ids = inputs.input_ids.to(model_wrapper.device)
             attention_mask = inputs.attention_mask.to(model_wrapper.device)
@@ -111,7 +114,7 @@ def evaluate_reasoning(model_wrapper, vector, layer_idx, samples, args):
                 with torch.no_grad():
                     output_ids = model_wrapper.model.generate(
                         input_ids,
-                        attention_mask=attention_mask, # 【修复】传入 mask
+                        attention_mask=attention_mask,
                         max_new_tokens=args.max_new_tokens,
                         do_sample=False, # Greedy decoding specifically for evaluation consistency
                         pad_token_id=model_wrapper.model.tokenizer.pad_token_id,
@@ -169,7 +172,6 @@ def get_baseline_performance(model_wrapper, samples, args):
         
         prompt = f"Question: {question}\nLet's think step by step."
         
-        # 【修复】显式构建 attention_mask 并移动到正确设备
         inputs = model_wrapper.model.tokenizer(prompt, return_tensors="pt")
         input_ids = inputs.input_ids.to(model_wrapper.device)
         attention_mask = inputs.attention_mask.to(model_wrapper.device)
@@ -177,7 +179,7 @@ def get_baseline_performance(model_wrapper, samples, args):
         with torch.no_grad():
             output_ids = model_wrapper.model.generate(
                 input_ids,
-                attention_mask=attention_mask, # 【修复】传入 mask
+                attention_mask=attention_mask,
                 max_new_tokens=args.max_new_tokens, 
                 do_sample=False,
                 pad_token_id=model_wrapper.model.tokenizer.pad_token_id,
@@ -195,8 +197,8 @@ def get_baseline_performance(model_wrapper, samples, args):
         if is_correct: results["correct"] += 1
         results["total_tokens"] += gen_len
         
-    avg_len = results["total_tokens"] / results["total"]
-    accuracy = results["correct"] / results["total"]
+    avg_len = results["total_tokens"] / results["total"] if results["total"] > 0 else 0
+    accuracy = results["correct"] / results["total"] if results["total"] > 0 else 0
     return accuracy, avg_len
 
 def main():
@@ -208,7 +210,8 @@ def main():
     parser.add_argument("--dataset", type=str, default="gsm8k")
     parser.add_argument("--num_samples", type=int, default=50, help="评估样本数量")
     parser.add_argument("--max_new_tokens", type=int, default=1024)
-    parser.add_argument("--target_methods", nargs="+", default=["extracted", "learnable", "self_evolved"])
+    # [新增] 默认包含 ua_vector
+    parser.add_argument("--target_methods", nargs="+", default=["extracted", "learnable", "self_evolved", "ua_vector"])
     parser.add_argument("--layers", nargs="+", type=int, help="指定层数")
     
     args = parser.parse_args()
@@ -219,17 +222,33 @@ def main():
         print(f"Error: Vector directory {args.vector_dir} not found.")
         return
 
+    # 扫描目录下所有的 .pt 文件
     files = [f for f in os.listdir(args.vector_dir) if f.endswith(".pt")]
     vector_configs = []
+    
+    print(f"Scanning vectors in {args.vector_dir}...")
+    
     for f in files:
         info = parse_filename(f)
-        if info and info['method'] in args.target_methods:
+        if info:
+            # 过滤方法
+            if info['method'] not in args.target_methods:
+                continue
+            # 过滤层数 (如果指定了)
             if args.layers and info['layer'] not in args.layers:
                 continue
             vector_configs.append(info)
+        else:
+            # 无法解析的文件跳过
+            pass
             
+    # 按方法和层数排序，方便阅读报告
     vector_configs.sort(key=lambda x: (x['method'], x['layer']))
     
+    if not vector_configs:
+        print("No matching vector files found. Please check --target_methods, --layers, or --vector_dir.")
+        return
+        
     print(f"Found {len(vector_configs)} vectors to evaluate.")
     
     # 2. 加载模型和Tokenizer
@@ -238,20 +257,9 @@ def main():
     
     print(f"Initializing Model Wrapper (loading model)...")
     model_wrapper = CoTModelWrapper(args.model_path, args.model_name)
+    model_wrapper.model.tokenizer = tokenizer # 绑定 tokenizer
     
-    # 手动把 tokenizer 绑到 model 上，方便后续 evaluate_reasoning 调用
-    model_wrapper.model.tokenizer = tokenizer
-
-    # 【重要修复】删除手动移动到 CUDA 的代码
-    # 因为 device_map="auto" 已经由 accelerate 托管了设备
-    # if torch.cuda.is_available():
-    #     print("Moving model to CUDA...")
-    #     model_wrapper.model.to("cuda")  <-- 已删除
-    
-    # 打印设备分布信息，确认加载正常
     print(f"Model device map: {model_wrapper.model.hf_device_map if hasattr(model_wrapper.model, 'hf_device_map') else 'Single Device'}")
-    
-    # 获取主设备用于存放向量 (通常是 device_map 的第一个设备)
     device = model_wrapper.device 
 
     print(f"Loading dataset {args.dataset}...")
@@ -298,7 +306,8 @@ def main():
         }
         report_data.append(row)
         
-        if abs(acc_change) > 0.05:
+        # 如果有显著变化，打印一些样本
+        if abs(acc_change) > 0.05 or examples:
             print(f"--- Sample Output ({config['method']} L{config['layer']}) ---")
             if examples:
                 print(f"Q: {examples[0]['q'][:100]}...")
@@ -313,8 +322,9 @@ def main():
     df = pd.DataFrame(report_data)
     if not df.empty:
         print(tabulate(df, headers="keys", tablefmt="grid"))
-        df.to_csv(os.path.join(args.vector_dir, "deep_eval_report.csv"), index=False)
-        print(f"\nReport saved to {os.path.join(args.vector_dir, 'deep_eval_report.csv')}")
+        output_csv = os.path.join(args.vector_dir, "deep_eval_report.csv")
+        df.to_csv(output_csv, index=False)
+        print(f"\nReport saved to {output_csv}")
     else:
         print("No results to report.")
 

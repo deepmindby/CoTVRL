@@ -151,8 +151,10 @@ class CoTModelWrapper(nn.Module):
                 modified = hidden_states + vec.expand_as(hidden_states)
             else:
                 # Inference: use pre-cached vector
-                modified = hidden_states + self._injection_vector_cached.expand_as(hidden_states)
-            
+                # modified = hidden_states + self._injection_vector_cached.expand_as(hidden_states)
+                vec = self._injection_vector_cached.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                modified = hidden_states + vec.expand_as(hidden_states)
+
             if rest is not None:
                 return (modified,) + rest
             return modified

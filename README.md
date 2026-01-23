@@ -25,8 +25,9 @@ v* = λ ⊙ μ                   # Final vector (Hadamard product)
 
 ## Quick Start
 
-### Extracted CoT Vector (Baseline)
+### Single-Layer Extraction and Evaluation
 ```bash
+# Extracted CoT Vector (Baseline)
 python main.py \
     --model_path /path/to/Qwen2.5-Math-7B \
     --data_path /path/to/data \
@@ -36,10 +37,8 @@ python main.py \
     --num_support_samples 100 \
     --num_test_samples 50 \
     --mode both
-```
 
-### UA-Vector (Recommended)
-```bash
+# UA-Vector (Recommended)
 python main.py \
     --model_path /path/to/Qwen2.5-Math-7B \
     --data_path /path/to/data \
@@ -53,43 +52,72 @@ python main.py \
     --mode both
 ```
 
-### Extract Only (No Evaluation)
+### Layer Sweep (Find Best Layer)
 ```bash
-python main.py \
+# Sweep all layers with extracted method
+python run_layer_sweep.py \
+    --model_path /path/to/Qwen2.5-Math-7B \
+    --data_path /path/to/data \
+    --dataset gsm8k \
+    --method extracted \
+    --layer_step 2 \
+    --num_support_samples 100 \
+    --num_test_samples 50
+
+# Sweep all layers with UA-Vector
+python run_layer_sweep.py \
+    --model_path /path/to/Qwen2.5-Math-7B \
+    --data_path /path/to/data \
+    --dataset gsm8k \
     --method ua_vector \
     --ua_gamma 1.0 \
-    --mode extract \
-    --save_vector
+    --layer_step 2 \
+    --num_support_samples 100 \
+    --num_test_samples 50
+
+# Sweep specific layers
+python run_layer_sweep.py \
+    --model_path /path/to/model \
+    --data_path /path/to/data \
+    --method ua_vector \
+    --layers 0,5,10,15,20,25 \
+    --save_vectors
 ```
 
-### Evaluate Pre-extracted Vector
+### Multi-Layer Injection (All Layers Simultaneously)
 ```bash
-python main.py \
-    --vector_path outputs/ua_vector_gsm8k_L15_xxx.pt \
-    --layer_idx 15 \
-    --mode eval
+# Inject UA-Vectors at ALL layers
+python run_multi_layer.py \
+    --model_path /path/to/Qwen2.5-Math-7B \
+    --data_path /path/to/data \
+    --dataset gsm8k \
+    --ua_gamma 1.0 \
+    --num_support_samples 100 \
+    --num_test_samples 50
+
+# Inject at specific layers
+python run_multi_layer.py \
+    --model_path /path/to/model \
+    --data_path /path/to/data \
+    --layers 10,15,20,25 \
+    --ua_gamma 1.0
+
+# Inject at layer range (layers 10-25)
+python run_multi_layer.py \
+    --model_path /path/to/model \
+    --data_path /path/to/data \
+    --layer_start 10 \
+    --layer_end 26 \
+    --ua_gamma 1.0
 ```
-
-## UA-Vector Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--ua_gamma` | 1.0 | Noise penalty factor γ. When γ=0, degrades to standard Extracted Vector |
-| `--ua_normalize_variance` | True | Normalize σ² by layer mean for cross-layer robustness |
-| `--no_ua_normalize_variance` | - | Disable variance normalization |
-
-### Choosing γ (Gamma)
-
-- **γ = 0**: No shrinkage, equivalent to Extracted Vector
-- **γ = 0.1-1.0**: Mild shrinkage, preserves most dimensions
-- **γ = 1.0-10.0**: Moderate shrinkage, suppresses noisy dimensions
-- **γ > 10**: Aggressive shrinkage, only preserves very consistent dimensions
 
 ## Project Structure
 
 ```
 cot_vectors/
-├── main.py                  # Entry point
+├── main.py                  # Single-layer entry point
+├── run_layer_sweep.py       # Layer sweep script
+├── run_multi_layer.py       # Multi-layer injection script
 ├── requirements.txt         # Dependencies
 ├── config/
 │   └── secrets.yaml         # WandB credentials
@@ -104,36 +132,46 @@ cot_vectors/
 │       ├── __init__.py      # Method registry
 │       ├── base.py          # Base class
 │       ├── extracted.py     # Extracted CoT Vector
-│       └── ua_vector.py     # UA-Vector (main contribution)
+│       ├── ua_vector.py     # UA-Vector (single layer)
+│       └── multi_layer_ua.py # Multi-layer UA-Vector
 └── outputs/                 # Saved vectors
 ```
 
 ## Key Arguments
 
-### General
-- `--model_path`: Path to pretrained model
-- `--model_name`: Model type (`qwen` or `llama`)
-- `--data_path`: Path to data directory
-- `--dataset`: Dataset (`gsm8k`, `math_easy`, `math_hard`, `mmlu_pro`)
-- `--layer_idx`: Layer index for vector injection/extraction
-- `--seed`: Random seed (default: 42)
+### UA-Vector Parameters
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--ua_gamma` | 1.0 | Noise penalty factor γ. When γ=0, degrades to standard Extracted Vector |
+| `--ua_normalize_variance` | True | Normalize σ² by layer mean for cross-layer robustness |
+| `--no_ua_normalize_variance` | - | Disable variance normalization |
 
-### Data
-- `--num_support_samples`: Support set size for extraction
-- `--num_test_samples`: Test set size for evaluation
+### Layer Sweep Parameters
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--layers` | None | Comma-separated layers (e.g., "0,5,10,15") |
+| `--layer_step` | 2 | Step size when testing all layers |
+| `--save_vectors` | False | Save vectors for each layer |
+| `--skip_baseline` | False | Skip baseline evaluation |
 
-### Generation
-- `--max_new_tokens`: Max tokens to generate (default: 512)
-- `--num_beams`: Beam search width (default: 3)
-- `--use_early_stopping`: Stop when answer detected
+### Multi-Layer Parameters
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--layers` | None | Comma-separated layers (None = all) |
+| `--layer_start` | None | Start layer index |
+| `--layer_end` | None | End layer index |
+| `--scaling_factor` | 1.0 | Global scaling for all vectors |
 
-### Logging
-- `--use_wandb`: Enable WandB logging
-- `--wandb_project`: WandB project name
+### Choosing γ (Gamma)
 
-## Output Statistics (UA-Vector)
+- **γ = 0**: No shrinkage, equivalent to Extracted Vector
+- **γ = 0.1-1.0**: Mild shrinkage, preserves most dimensions
+- **γ = 1.0-10.0**: Moderate shrinkage, suppresses noisy dimensions
+- **γ > 10**: Aggressive shrinkage, only preserves very consistent dimensions
 
-When using `--method ua_vector`, the following statistics are reported:
+## Output Statistics
+
+When using UA-Vector methods, the following statistics are reported:
 
 | Statistic | Description |
 |-----------|-------------|
@@ -163,16 +201,4 @@ data/
 Each JSONL file should have lines with:
 ```json
 {"question": "...", "answer": "...", "cot": "..."}
-```
-
-## Citation
-
-If you use UA-Vector in your research, please cite:
-
-```bibtex
-@article{cot_vectors,
-  title={CoT Vectors: Transferring and Probing the Reasoning Mechanisms of LLMs},
-  author={...},
-  year={2024}
-}
 ```
