@@ -2,34 +2,16 @@
 """
 Multi-Layer UA-Vector: Extract and inject vectors at multiple (or all) layers.
 
-This script extracts UA-Vectors at multiple layers simultaneously and
-evaluates their combined effect when injected together.
-
-Usage:
-    # All layers
-    python run_multi_layer.py \
-        --model_path /path/to/model \
-        --data_path /path/to/data \
-        --dataset gsm8k \
-        --ua_gamma 1.0
-
-    # Specific layers
-    python run_multi_layer.py \
-        --model_path /path/to/model \
-        --layers 0,5,10,15,20 \
-        --ua_gamma 1.0
-
-    # Layer range
-    python run_multi_layer.py \
-        --model_path /path/to/model \
-        --layer_start 10 \
-        --layer_end 20 \
-        --ua_gamma 1.0
+Updates:
+- Added --manual_baseline to skip baseline evaluation.
+- Added warnings for early layer injection.
+- Added --auto_scale (default True) to prevent over-steering.
 """
 
 import os
 import argparse
 import torch
+import math
 from datetime import datetime
 
 from src.models import CoTModelWrapper, load_tokenizer
@@ -67,8 +49,14 @@ def parse_args():
                         help="Noise penalty factor γ")
     parser.add_argument("--ua_normalize_variance", action="store_true", default=True)
     parser.add_argument("--no_ua_normalize_variance", action="store_true", default=False)
+    
+    # Injection scaling configuration
     parser.add_argument("--scaling_factor", type=float, default=1.0,
-                        help="Global scaling factor for injection")
+                        help="Base scaling factor. If auto_scale is True, this is the 'total energy' target.")
+    parser.add_argument("--auto_scale", action="store_true", default=True,
+                        help="Automatically reduce per-layer scaling factor by 1/sqrt(N).")
+    parser.add_argument("--no_auto_scale", action="store_false", dest="auto_scale",
+                        help="Disable auto-scaling.")
     
     # Data configuration
     parser.add_argument("--num_support_samples", type=int, default=100)
@@ -80,7 +68,11 @@ def parse_args():
     parser.add_argument("--num_beams", type=int, default=3)
     
     # Mode
-    parser.add_argument("--skip_baseline", action="store_true", default=False)
+    parser.add_argument("--skip_baseline", action="store_true", default=False,
+                        help="Skip baseline evaluation entirely (no result reported)")
+    parser.add_argument("--manual_baseline", type=float, default=None,
+                        help="Skip baseline evaluation and use this fixed accuracy (e.g., 0.90) for comparison")
+    
     parser.add_argument("--save_vectors", action="store_true", default=True)
     parser.add_argument("--load_vectors", type=str, default=None,
                         help="Load pre-extracted vectors from file")
@@ -126,7 +118,6 @@ def main():
     print(f"Gamma (γ): {args.ua_gamma}")
     normalize_var = args.ua_normalize_variance and not args.no_ua_normalize_variance
     print(f"Normalize variance: {normalize_var}")
-    print(f"Scaling factor: {args.scaling_factor}")
     print("=" * 70)
     
     # Setup WandB
@@ -144,6 +135,29 @@ def main():
     layer_indices = determine_layers(args, model_wrapper.num_layers)
     print(f"Target layers: {layer_indices} ({len(layer_indices)} layers)")
     
+    # SAFETY WARNING
+    if any(l < 5 for l in layer_indices):
+        print("\n" + "!" * 70)
+        print("WARNING: You are injecting vectors into early layers (0-4).")
+        print("This often causes 'Early Layer Collapse', leading to 0% accuracy.")
+        print("Suggestion: Use --layer_start 5 or --layer_start 10 to skip early layers.")
+        print("!" * 70)
+
+    # --- Auto-Scaling Logic ---
+    effective_scaling_factor = args.scaling_factor
+    if args.auto_scale and len(layer_indices) > 1:
+        # Heuristic: 1 / sqrt(N)
+        scale_ratio = 1.0 / math.sqrt(len(layer_indices))
+        effective_scaling_factor = args.scaling_factor * scale_ratio
+        print(f"\n[Auto-Scale] Enabled for {len(layer_indices)} layers.")
+        print(f"  Base factor: {args.scaling_factor}")
+        print(f"  Adjustment:  x {scale_ratio:.4f} (1/sqrt(N))")
+        print(f"  Effective per-layer scale: {effective_scaling_factor:.4f}")
+    else:
+        print(f"\n[Auto-Scale] Disabled or Single Layer.")
+        print(f"  Using raw scaling factor: {effective_scaling_factor}")
+    print("=" * 70)
+
     # Load data
     print("\nLoading data...")
     support_samples = load_dataset(args.data_path, args.dataset, "train", args.num_support_samples)
@@ -179,9 +193,17 @@ def main():
             )
             multi_layer.save(save_path)
     
-    # Baseline evaluation
+    # Baseline evaluation logic
     baseline_accuracy = None
-    if not args.skip_baseline:
+    
+    if args.manual_baseline is not None:
+        print("\n" + "=" * 70)
+        print(f"Using Manual Baseline (Skipping Eval)")
+        print("=" * 70)
+        baseline_accuracy = args.manual_baseline
+        print(f"Baseline accuracy set to: {baseline_accuracy:.2%}")
+        
+    elif not args.skip_baseline:
         print("\n" + "=" * 70)
         print("Baseline Evaluation (no injection)")
         print("=" * 70)
@@ -196,10 +218,13 @@ def main():
         )
         baseline_accuracy = baseline_results['accuracy']
         print(f"Baseline accuracy: {baseline_accuracy:.2f}%")
+    else:
+        print("\nSkipping baseline evaluation (no comparison will be shown).")
     
     # Multi-layer injection evaluation
     print("\n" + "=" * 70)
     print(f"Multi-Layer Injection Evaluation ({len(layer_indices)} layers)")
+    print(f"Effective Scaling Factor: {effective_scaling_factor:.4f}")
     print("=" * 70)
     
     evaluator = MultiLayerEvaluator(
@@ -213,7 +238,7 @@ def main():
     
     injection_results = evaluator.evaluate_dataset(
         test_samples,
-        scaling_factor=args.scaling_factor,
+        scaling_factor=effective_scaling_factor,
         desc="Multi-Layer Eval"
     )
     
@@ -224,14 +249,24 @@ def main():
     print(f"Dataset:         {args.dataset}")
     print(f"Layers used:     {len(layer_indices)} layers")
     print(f"Gamma (γ):       {args.ua_gamma}")
-    print(f"Scaling factor:  {args.scaling_factor}")
+    print(f"Base Scale:      {args.scaling_factor}")
+    print(f"Effective Scale: {effective_scaling_factor:.4f}")
     print("-" * 70)
     
     if baseline_accuracy is not None:
-        print(f"Baseline:        {baseline_accuracy:.2f}%")
-        diff = injection_results['accuracy'] - baseline_accuracy
+        # Check if baseline_accuracy is float (0.9) or percent (90.0) for display consistency
+        # Assuming run_baseline_evaluation returns 0-100 or 0-1, let's normalize to % string
+        
+        # If manual baseline is entered as 0.9, treat as 90%
+        # If run_baseline returns 90.0, treat as 90%
+        
+        base_val = baseline_accuracy if baseline_accuracy > 1.0 else baseline_accuracy * 100
+        curr_val = injection_results['accuracy']
+        
+        print(f"Baseline:        {base_val:.2f}%")
+        diff = curr_val - base_val
         sign = "+" if diff >= 0 else ""
-        print(f"Multi-Layer:     {injection_results['accuracy']:.2f}% [{sign}{diff:.2f}%]")
+        print(f"Multi-Layer:     {curr_val:.2f}% [{sign}{diff:.2f}%]")
     else:
         print(f"Multi-Layer:     {injection_results['accuracy']:.2f}%")
     
@@ -241,7 +276,7 @@ def main():
     avg_lambda = sum(s['lambda_mean'] for s in stats.values()) / len(stats)
     
     print("-" * 70)
-    print(f"Total vector norm: {total_norm:.4f}")
+    print(f"Total vector norm (raw sum): {total_norm:.4f}")
     print(f"Average λ:         {avg_lambda:.4f}")
     print("=" * 70)
     
@@ -250,8 +285,8 @@ def main():
         wandb_run.log({
             "eval/baseline_accuracy": baseline_accuracy,
             "eval/multilayer_accuracy": injection_results['accuracy'],
-            "eval/improvement": injection_results['accuracy'] - (baseline_accuracy or 0),
             "eval/num_layers": len(layer_indices),
+            "eval/effective_scaling": effective_scaling_factor,
             "eval/total_vector_norm": total_norm,
             "eval/avg_lambda": avg_lambda,
         })

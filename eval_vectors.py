@@ -21,9 +21,10 @@ except ImportError:
 from src.data_utils import load_dataset
 from src.utils import extract_answer_from_text, compare_answers, set_seed
 
-def parse_filename(filename):
+def parse_filename(filename, base_dir):
     """
     解析文件名，提取方法、数据集和层数。
+    [Fix] base_dir: 接收传入的目录路径，而不是硬编码 'outputs'
     """
     name = os.path.splitext(filename)[0]
     
@@ -40,7 +41,7 @@ def parse_filename(filename):
         method = "learnable"
     elif name.startswith("self_evolved"):
         method = "self_evolved"
-    elif name.startswith("ua_vector"):  # [新增] 支持 ua_vector
+    elif name.startswith("ua_vector"):
         method = "ua_vector"
     else:
         method = "unknown"
@@ -49,7 +50,7 @@ def parse_filename(filename):
         "filename": filename,
         "method": method,
         "layer": layer_idx,
-        "path": os.path.join("outputs", filename)
+        "path": os.path.join(base_dir, filename)  # [Fix] 使用传入的 base_dir
     }
 
 def analyze_vector_stats(vector_path, device):
@@ -116,7 +117,7 @@ def evaluate_reasoning(model_wrapper, vector, layer_idx, samples, args):
                         input_ids,
                         attention_mask=attention_mask,
                         max_new_tokens=args.max_new_tokens,
-                        do_sample=False, # Greedy decoding specifically for evaluation consistency
+                        do_sample=False, # Greedy decoding for consistency
                         pad_token_id=model_wrapper.model.tokenizer.pad_token_id,
                         eos_token_id=model_wrapper.model.tokenizer.eos_token_id
                     )
@@ -210,9 +211,11 @@ def main():
     parser.add_argument("--dataset", type=str, default="gsm8k")
     parser.add_argument("--num_samples", type=int, default=50, help="评估样本数量")
     parser.add_argument("--max_new_tokens", type=int, default=1024)
-    # [新增] 默认包含 ua_vector
     parser.add_argument("--target_methods", nargs="+", default=["extracted", "learnable", "self_evolved", "ua_vector"])
     parser.add_argument("--layers", nargs="+", type=int, help="指定层数")
+    
+    # [新增] 跳过 Baseline 参数
+    parser.add_argument("--skip_baseline", action="store_true", help="Skip baseline evaluation (saves time)")
     
     args = parser.parse_args()
     set_seed(42)
@@ -229,20 +232,15 @@ def main():
     print(f"Scanning vectors in {args.vector_dir}...")
     
     for f in files:
-        info = parse_filename(f)
+        # [Fix] 传入 args.vector_dir 而不是写死
+        info = parse_filename(f, args.vector_dir)
         if info:
-            # 过滤方法
             if info['method'] not in args.target_methods:
                 continue
-            # 过滤层数 (如果指定了)
             if args.layers and info['layer'] not in args.layers:
                 continue
             vector_configs.append(info)
-        else:
-            # 无法解析的文件跳过
-            pass
             
-    # 按方法和层数排序，方便阅读报告
     vector_configs.sort(key=lambda x: (x['method'], x['layer']))
     
     if not vector_configs:
@@ -257,7 +255,7 @@ def main():
     
     print(f"Initializing Model Wrapper (loading model)...")
     model_wrapper = CoTModelWrapper(args.model_path, args.model_name)
-    model_wrapper.model.tokenizer = tokenizer # 绑定 tokenizer
+    model_wrapper.model.tokenizer = tokenizer 
     
     print(f"Model device map: {model_wrapper.model.hf_device_map if hasattr(model_wrapper.model, 'hf_device_map') else 'Single Device'}")
     device = model_wrapper.device 
@@ -265,9 +263,13 @@ def main():
     print(f"Loading dataset {args.dataset}...")
     dataset = load_dataset(args.data_path, args.dataset, split="test", num_samples=args.num_samples)
     
-    # 3. 运行 Baseline
-    base_acc, base_len = get_baseline_performance(model_wrapper, dataset, args)
-    print(f"\nBaseline | Acc: {base_acc:.2%} | Avg Len: {base_len:.1f} tokens")
+    # 3. 运行 Baseline (Optionally Skipped)
+    base_acc, base_len = None, None
+    if not args.skip_baseline:
+        base_acc, base_len = get_baseline_performance(model_wrapper, dataset, args)
+        print(f"\nBaseline | Acc: {base_acc:.2%} | Avg Len: {base_len:.1f} tokens")
+    else:
+        print("\n[Info] Skipping Baseline Evaluation as requested.")
     
     # 4. 评估每个向量
     report_data = []
@@ -282,46 +284,65 @@ def main():
         # 评估
         acc, avg_len, examples = evaluate_reasoning(model_wrapper, vec, config['layer'], dataset, args)
         
-        len_change_ratio = (avg_len - base_len) / base_len if base_len > 0 else 0
-        acc_change = acc - base_acc
-        
-        diagnosis = "Neutral"
-        if acc_change > 0.05:
-            if len_change_ratio < -0.3:
-                diagnosis = "⚠️ Shortcut (Acc Up, Len Down)"
-            elif len_change_ratio > -0.05:
-                diagnosis = "✅ Real CoT (Acc Up, Len Stable/Up)"
-        elif acc_change < -0.1:
-            diagnosis = "❌ Damaged"
+        # 计算 Delta (如果 Baseline 存在)
+        if base_acc is not None:
+            len_change_ratio = (avg_len - base_len) / base_len if base_len > 0 else 0
+            acc_change = acc - base_acc
+            acc_str = f"{acc:.2%} (Delta: {acc_change:+.2%})"
+            acc_delta_str = f"{acc_change:+.2%}"
+            len_delta_str = f"{len_change_ratio:+.1%}"
             
+            # 诊断逻辑
+            diagnosis = "Neutral"
+            if acc_change > 0.05:
+                if len_change_ratio < -0.3:
+                    diagnosis = "⚠️ Shortcut"
+                elif len_change_ratio > -0.05:
+                    diagnosis = "✅ Real CoT"
+            elif acc_change < -0.1:
+                diagnosis = "❌ Damaged"
+        else:
+            # Baseline 跳过时的显示逻辑
+            acc_str = f"{acc:.2%}"
+            acc_delta_str = "N/A"
+            len_delta_str = "N/A"
+            diagnosis = "N/A"
+        
+        # 实时打印结果
+        print(f" >> [Result] Layer {config['layer']}: Acc = {acc_str}, AvgLen = {avg_len:.1f}")
+
         row = {
             "Method": config['method'],
             "Layer": config['layer'],
             "Norm": f"{stats['norm']:.2f}",
             "Acc": f"{acc:.2%}",
-            "Acc Delta": f"{acc_change:+.2%}",
+            "Acc Delta": acc_delta_str,
             "Len": f"{avg_len:.0f}",
-            "Len Delta": f"{len_change_ratio:+.1%}",
+            "Len Delta": len_delta_str,
             "Diagnosis": diagnosis
         }
         report_data.append(row)
         
-        # 如果有显著变化，打印一些样本
-        if abs(acc_change) > 0.05 or examples:
+        # 打印样本
+        if examples:
             print(f"--- Sample Output ({config['method']} L{config['layer']}) ---")
-            if examples:
-                print(f"Q: {examples[0]['q'][:100]}...")
-                print(f"Pred: ...{examples[0]['full_text']}")
+            print(f"Q: {examples[0]['q'][:100]}...")
+            print(f"Pred: ...{examples[0]['full_text']}")
             print("---------------------------------------------")
 
     print("\n" + "="*80)
     print("FINAL EVALUATION REPORT")
     print("="*80)
-    print(f"Baseline Accuracy: {base_acc:.2%} | Baseline Avg Length: {base_len:.0f}")
     
+    if base_acc is not None:
+        print(f"Baseline Accuracy: {base_acc:.2%} | Baseline Avg Length: {base_len:.0f}")
+    else:
+        print("Baseline: Skipped")
+
     df = pd.DataFrame(report_data)
     if not df.empty:
         print(tabulate(df, headers="keys", tablefmt="grid"))
+        # 保存到 vector_dir 下
         output_csv = os.path.join(args.vector_dir, "deep_eval_report.csv")
         df.to_csv(output_csv, index=False)
         print(f"\nReport saved to {output_csv}")
